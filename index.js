@@ -1,4 +1,3 @@
-import path from "node:path";
 import mime from "mime";
 import config from "./config.js";
 
@@ -12,7 +11,7 @@ import config from "./config.js";
  * - Flagged server-specific transport modules: `@nebula-services/bare-server-node` and `@mercuryworkshop/wisp-js/server`
  *   rely on raw Node.js HTTP server sockets (`http.IncomingMessage`, `net.Socket`) and cannot run directly in edge V8 environments.
  *   For Bare/Wisp proxy functionality on Cloudflare Workers, use edge-compatible WebSockets/Fetch API or delegate to an external Bare server.
- * - Compatibility flag required in wrangler.toml: `compatibility_flags = ["nodejs_compat"]`.
+ * - Compatibility flag included in wrangler.toml: `compatibility_flags = ["nodejs_compat"]`.
  */
 
 // In-memory asset cache (per Worker instance)
@@ -28,6 +27,14 @@ const ROUTE_MAP = new Map([
   ["/d", "/tabs.html"],
   ["/", "/index.html"],
 ]);
+
+/**
+ * Get file extension from pathname or URL string
+ */
+function getExtname(filename) {
+  const dotIndex = filename.lastIndexOf(".");
+  return dotIndex < 0 ? "" : filename.slice(dotIndex);
+}
 
 /**
  * Verify Basic Auth credentials against config.users
@@ -147,7 +154,7 @@ async function handleAssetProxy(pathname, _request) {
     }
 
     const arrayBuffer = await assetResponse.arrayBuffer();
-    const ext = path.extname(reqTarget);
+    const ext = getExtname(reqTarget);
     const no = [".unityweb"];
     const contentType = no.includes(ext) ? "application/octet-stream" : mime.getType(ext) || "application/octet-stream";
 

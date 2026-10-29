@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "interstellar" generated at 2026-10-29T05:57:07.603Z.

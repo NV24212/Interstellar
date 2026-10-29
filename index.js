@@ -1,167 +1,178 @@
-import fs from "node:fs";
-import http from "node:http";
-import path from "node:path";
-import { createBareServer } from "@nebula-services/bare-server-node";
-import chalk from "chalk";
-import cookieParser from "cookie-parser";
-import cors from "cors";
-import express from "express";
-import basicAuth from "express-basic-auth";
-import bareMuxNode from "@mercuryworkshop/bare-mux/node";
-import { server as wisp } from "@mercuryworkshop/wisp-js/server";
 import mime from "mime";
-import fetch from "node-fetch";
-// import { setupMasqr } from "./Masqr.js";
 import config from "./config.js";
 
-console.log(chalk.yellow("🚀 Starting server..."));
+/**
+ * Cloudflare Workers Entry Point for Interstellar
+ *
+ * NODE.JS DEPENDENCY & RUNTIME COMPATIBILITY NOTES:
+ * - Removed long-running HTTP listeners (`http.createServer()`, `server.listen()`, `server.on('upgrade')`, Express `app.listen()`).
+ * - Removed Node.js `fs` calls and `express.static()`. Static assets are served via Cloudflare Workers Static Assets (`env.ASSETS`).
+ * - Removed `node-fetch` in favor of native global Web `fetch()`.
+ * - Flagged server-specific transport modules: `@nebula-services/bare-server-node` and `@mercuryworkshop/wisp-js/server`
+ *   rely on raw Node.js HTTP server sockets (`http.IncomingMessage`, `net.Socket`) and cannot run directly in edge V8 environments.
+ *   For Bare/Wisp proxy functionality on Cloudflare Workers, use edge-compatible WebSockets/Fetch API or delegate to an external Bare server.
+ * - Compatibility flag included in wrangler.toml: `compatibility_flags = ["nodejs_compat"]`.
+ */
 
-const __dirname = process.cwd();
-const server = http.createServer();
-const app = express();
-const bareServer = createBareServer("/ca/");
-const { baremuxPath } = bareMuxNode;
-const epoxyDistPath = path.join(
-  __dirname,
-  "node_modules",
-  "@mercuryworkshop",
-  "epoxy-transport",
-  "dist",
-);
-const PORT = process.env.PORT || 8080;
+// In-memory asset cache (per Worker instance)
 const cache = new Map();
-const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // Cache for 30 Days
+const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-wisp.options.allow_loopback_ips = true;
-wisp.options.allow_private_ips = true;
+// Route mappings for static HTML pages
+const ROUTE_MAP = new Map([
+  ["/b", "/apps.html"],
+  ["/a", "/games.html"],
+  ["/play.html", "/games.html"],
+  ["/c", "/settings.html"],
+  ["/d", "/tabs.html"],
+  ["/", "/index.html"],
+]);
 
-if (config.challenge !== false) {
-  console.log(chalk.green("🔒 Password protection is enabled! Listing logins below"));
-  // biome-ignore lint: idk
-  Object.entries(config.users).forEach(([username, password]) => {
-    console.log(chalk.blue(`Username: ${username}, Password: ${password}`));
-  });
-  app.use(basicAuth({ users: config.users, challenge: true }));
+/**
+ * Get file extension from pathname or URL string
+ */
+function getExtname(filename) {
+  const dotIndex = filename.lastIndexOf(".");
+  return dotIndex < 0 ? "" : filename.slice(dotIndex);
 }
 
-app.get("/e/*", async (req, res, next) => {
+/**
+ * Verify Basic Auth credentials against config.users
+ */
+function checkBasicAuth(request) {
+  if (config.challenge === false) return true;
+
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Basic ")) return false;
+
   try {
-    if (cache.has(req.path)) {
-      const { data, contentType, timestamp } = cache.get(req.path);
-      if (Date.now() - timestamp > CACHE_TTL) {
-        cache.delete(req.path);
-      } else {
-        res.writeHead(200, { "Content-Type": contentType });
-        return res.end(data);
-      }
-    }
+    const base64Credentials = authHeader.split(" ")[1];
+    const credentials = atob(base64Credentials);
+    const [username, password] = credentials.split(":");
 
-    const baseUrls = {
-      "/e/1/": "https://raw.githubusercontent.com/qrs/x/fixy/",
-      "/e/2/": "https://raw.githubusercontent.com/3v1/V5-Assets/main/",
-      "/e/3/": "https://raw.githubusercontent.com/3v1/V5-Retro/master/",
-    };
-
-    let reqTarget;
-    for (const [prefix, baseUrl] of Object.entries(baseUrls)) {
-      if (req.path.startsWith(prefix)) {
-        reqTarget = baseUrl + req.path.slice(prefix.length);
-        break;
-      }
-    }
-
-    if (!reqTarget) {
-      return next();
-    }
-
-    const asset = await fetch(reqTarget);
-    if (!asset.ok) {
-      return next();
-    }
-
-    const data = Buffer.from(await asset.arrayBuffer());
-    const ext = path.extname(reqTarget);
-    const no = [".unityweb"];
-    const contentType = no.includes(ext) ? "application/octet-stream" : mime.getType(ext);
-
-    cache.set(req.path, { data, contentType, timestamp: Date.now() });
-    res.writeHead(200, { "Content-Type": contentType });
-    res.end(data);
-  } catch (error) {
-    console.error("Error fetching asset:", error);
-    res.setHeader("Content-Type", "text/html");
-    res.status(500).send("Error fetching the asset");
+    return config.users && config.users[username] === password;
+  } catch (_err) {
+    return false;
   }
-});
+}
 
-app.use(cookieParser());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+export default {
+  /**
+   * Main Cloudflare Worker Fetch Handler
+   * @param {Request} request
+   * @param {Object} env
+   * @param {ExecutionContext} _ctx
+   * @returns {Promise<Response>}
+   */
+  async fetch(request, env, _ctx) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
-/* if (process.env.MASQR === "true") {
-  console.log(chalk.green("Masqr is enabled"));
-  setupMasqr(app);
-} */
-
-const transportStaticOptions = {
-  setHeaders: (res, filePath) => {
-    const ext = path.extname(filePath);
-    if (ext === ".mjs" || ext === ".js") {
-      res.type("text/javascript");
-    } else if (ext === ".wasm") {
-      res.type("application/wasm");
+    // 1. Password Protection Check
+    if (!checkBasicAuth(request)) {
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": 'Basic realm="Interstellar Password Protection"',
+          "Content-Type": "text/plain",
+        },
+      });
     }
+
+    // 2. Asset Proxy Handling (`/e/*`)
+    if (pathname.startsWith("/e/")) {
+      return handleAssetProxy(pathname, request);
+    }
+
+    // 3. Static Page Route Rewriting (`/a`, `/b`, `/c`, `/d`, `/play.html`, `/`)
+    const targetPath = ROUTE_MAP.get(pathname) || pathname;
+
+    // 4. Serve Static Assets via env.ASSETS
+    if (env.ASSETS) {
+      const assetUrl = new URL(targetPath, request.url);
+      const assetRequest = new Request(assetUrl.toString(), request);
+      const response = await env.ASSETS.fetch(assetRequest);
+
+      if (response.status === 404) {
+        // Fallback to 404.html
+        const notFoundUrl = new URL("/404.html", request.url);
+        const notFoundResponse = await env.ASSETS.fetch(new Request(notFoundUrl.toString(), request));
+        return new Response(notFoundResponse.body, {
+          status: 404,
+          headers: notFoundResponse.headers,
+        });
+      }
+
+      return response;
+    }
+
+    return new Response("Static asset handling requires env.ASSETS binding in wrangler.toml", {
+      status: 500,
+      headers: { "Content-Type": "text/plain" },
+    });
   },
 };
 
-app.use(express.static(path.join(__dirname, "static")));
-app.use("/ca", cors({ origin: true }));
-app.use("/bm", express.static(baremuxPath, transportStaticOptions));
-app.use("/ep", express.static(epoxyDistPath, transportStaticOptions));
+/**
+ * Handle proxying and caching assets under `/e/*`
+ */
+async function handleAssetProxy(pathname, _request) {
+  const baseUrls = {
+    "/e/1/": "https://raw.githubusercontent.com/qrs/x/fixy/",
+    "/e/2/": "https://raw.githubusercontent.com/3v1/V5-Assets/main/",
+    "/e/3/": "https://raw.githubusercontent.com/3v1/V5-Retro/master/",
+  };
 
-const routes = [
-  { path: "/b", file: "apps.html" },
-  { path: "/a", file: "games.html" },
-  { path: "/play.html", file: "games.html" },
-  { path: "/c", file: "settings.html" },
-  { path: "/d", file: "tabs.html" },
-  { path: "/", file: "index.html" },
-];
-
-// biome-ignore lint: idk
-routes.forEach(route => {
-  app.get(route.path, (_req, res) => {
-    res.sendFile(path.join(__dirname, "static", route.file));
-  });
-});
-
-app.use((req, res, next) => {
-  res.status(404).sendFile(path.join(__dirname, "static", "404.html"));
-});
-
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).sendFile(path.join(__dirname, "static", "404.html"));
-});
-
-server.on("request", (req, res) => {
-  if (bareServer.shouldRoute(req)) {
-    bareServer.routeRequest(req, res);
-  } else {
-    app(req, res);
+  let reqTarget;
+  for (const [prefix, baseUrl] of Object.entries(baseUrls)) {
+    if (pathname.startsWith(prefix)) {
+      reqTarget = baseUrl + pathname.slice(prefix.length);
+      break;
+    }
   }
-});
 
-server.on("upgrade", (req, socket, head) => {
-  if (bareServer.shouldRoute(req)) {
-    bareServer.routeUpgrade(req, socket, head);
-  } else {
-    wisp.routeRequest(req, socket, head);
+  if (!reqTarget) {
+    return new Response("Not Found", { status: 404 });
   }
-});
 
-server.on("listening", () => {
-  console.log(chalk.green(`🌍 Server is running on http://localhost:${PORT}`));
-});
+  // Check in-memory cache
+  if (cache.has(pathname)) {
+    const { data, contentType, timestamp } = cache.get(pathname);
+    if (Date.now() - timestamp <= CACHE_TTL) {
+      return new Response(data, {
+        status: 200,
+        headers: { "Content-Type": contentType },
+      });
+    }
+    cache.delete(pathname);
+  }
 
-server.listen({ port: PORT });
+  try {
+    const assetResponse = await fetch(reqTarget);
+    if (!assetResponse.ok) {
+      return new Response("Asset Not Found", { status: 404 });
+    }
+
+    const arrayBuffer = await assetResponse.arrayBuffer();
+    const ext = getExtname(reqTarget);
+    const no = [".unityweb"];
+    const contentType = no.includes(ext) ? "application/octet-stream" : mime.getType(ext) || "application/octet-stream";
+
+    cache.set(pathname, {
+      data: arrayBuffer,
+      contentType,
+      timestamp: Date.now(),
+    });
+
+    return new Response(arrayBuffer, {
+      status: 200,
+      headers: { "Content-Type": contentType },
+    });
+  } catch (error) {
+    console.error("Error fetching proxy asset:", error);
+    return new Response("Error fetching the asset", {
+      status: 500,
+      headers: { "Content-Type": "text/html" },
+    });
+  }
+}
